@@ -1,9 +1,3 @@
-"""Streamlit app: Indonesian legal document (PDF/DOCX) -> structured review table.
-
-Single-file version. Deploy with:  app.py + requirements.txt
-Sections: 1) patterns & hierarchy detector  2) PDF reader  3) DOCX reader
-          4) table builder & Excel export   5) Streamlit UI
-"""
 from __future__ import annotations
 
 from collections import Counter
