@@ -1,3 +1,9 @@
+"""Streamlit app: Indonesian legal document (PDF/DOCX) -> structured review table (Word).
+
+Single-file version. Deploy with:  app.py + requirements.txt
+Sections: 1) patterns & hierarchy detector  2) PDF reader  3) DOCX reader
+          4) table builder & Word export   5) Streamlit UI
+"""
 from __future__ import annotations
 
 from collections import Counter
@@ -11,9 +17,10 @@ import streamlit as st
 from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-
+from docx.enum.section import WD_ORIENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt, RGBColor
 
 
 # ======================================================================
@@ -252,7 +259,7 @@ def extract_docx_lines(file) -> tuple[list[str], list[str]]:
     return lines, warnings
 
 # ======================================================================
-# 4. TABLE BUILDER & EXCEL
+# 4. TABLE BUILDER & WORD
 # ======================================================================
 COLUMNS = ["No", "Bab", "Pasal", "Ayat", "Huruf", "Angka", "Bagian",
            "Draft RPM", "Masukan", "Justifikasi"]
@@ -269,12 +276,12 @@ def _label(item) -> str:
     return " ".join(p for p in parts if p)
 
 
-def build_rows(doc: ParsedDocument, include_parent_text: bool = False) -> pd.DataFrame:
+def build_rows(doc: ParsedDocument) -> pd.DataFrame:
     """One row per leaf provision. Parents that only introduce sub-items
-    (e.g. '(3) meliputi:') are skipped unless include_parent_text=True."""
+    (e.g. '(3) meliputi:') are skipped."""
     rows = []
     for it in doc.items:
-        if not it.text or (it.has_children and not include_parent_text):
+        if not it.text or it.has_children:
             continue
         p = dict(it.path)
         rows.append({
@@ -292,97 +299,89 @@ def build_rows(doc: ParsedDocument, include_parent_text: bool = False) -> pd.Dat
     return df
 
 
-def hierarchy_preview(doc: ParsedDocument, width: int = 90) -> str:
-    """Indented text tree for the UI."""
-    out, last_bab, last_pasal = [], None, None
-    for it in doc.items:
-        if it.section != "Body":
-            out.append(f"{_label(it)}: {it.text[:width]}")
-            continue
-        if it.bab != last_bab:
-            out.append(f"\n{it.bab} {doc.bab_titles.get(it.bab, '')}".rstrip())
-            last_bab, last_pasal = it.bab, None
-        if it.pasal != last_pasal:
-            out.append(f"  {it.pasal}")
-            last_pasal = it.pasal
-        if it.path:
-            tag = " ".join(f"{t}:{v}" if t != "ayat" else v for t, v in it.path)
-            out.append("    " + "  " * (len(it.path) - 1) + f"{tag}  {it.text[:width]}")
-        elif it.text:
-            out.append(f"    {it.text[:width]}")
-    return "\n".join(out)
+def _shade(cell, color: str):
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto"); shd.set(qn("w:fill"), color)
+    tcPr.append(shd)
 
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
+def to_word_bytes(df: pd.DataFrame, title: str = "Tabel Review Draft RPM") -> bytes:
+    """Landscape A4 Word document containing the review table."""
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = Cm(29.7), Cm(21.0)
+    sec.left_margin = sec.right_margin = Cm(1.2)
+    sec.top_margin = sec.bottom_margin = Cm(1.5)
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(9)
+    doc.add_heading(title, level=1)
+
+    widths = [1.0, 1.8, 1.8, 1.3, 1.3, 1.3, 4.0, 8.2, 3.2, 3.2]   # cm, total ~27.1
+    table = doc.add_table(rows=1, cols=len(COLUMNS))
+    table.style = "Table Grid"
+    table.autofit = False
+
+    for i, name in enumerate(COLUMNS):                              # header row
+        c = table.rows[0].cells[i]
+        c.text = ""
+        run = c.paragraphs[0].add_run(name)
+        run.bold = True; run.font.color.rgb = RGBColor(255, 255, 255)
+        _shade(c, "1F4E78")
+    trPr = table.rows[0]._tr.get_or_add_trPr()                      # repeat header on each page
+    hdr = OxmlElement("w:tblHeader"); hdr.set(qn("w:val"), "true"); trPr.append(hdr)
+
+    for rec in df.itertuples(index=False):
+        cells = table.add_row().cells
+        for i, v in enumerate(rec):
+            cells[i].text = str(v)
+
+    for row in table.rows:
+        for i, w in enumerate(widths):
+            row.cells[i].width = Cm(w)
+
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        df.to_excel(xw, index=False, sheet_name="Review RPM")
-        ws = xw.sheets["Review RPM"]
-        for c in ws[1]:
-            c.font = Font(bold=True, color="FFFFFF")
-            c.fill = PatternFill("solid", fgColor="1F4E78")
-            c.alignment = Alignment(horizontal="center", vertical="center")
-        widths = {"No": 6, "Bab": 10, "Pasal": 10, "Ayat": 8, "Huruf": 8, "Angka": 8,
-                  "Bagian": 28, "Draft RPM": 70, "Masukan": 40, "Justifikasi": 40}
-        for i, name in enumerate(df.columns, 1):
-            ws.column_dimensions[get_column_letter(i)].width = widths.get(name, 15)
-        for row in ws.iter_rows(min_row=2):
-            for c in row:
-                c.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
+    doc.save(buf)
     return buf.getvalue()
 
+
 # ======================================================================
-# 5. STREAMLIT UI
+# 5. STREAMLIT UI  (input -> process -> download)
 # ======================================================================
 def main():
-    st.set_page_config(page_title="Parser RPM", layout="wide")
-    st.title("📑 Parser Draft Regulasi → Tabel Review")
-
-    with st.sidebar:
-        st.header("Opsi")
-        include_parent = st.checkbox("Sertakan baris induk (kalimat pengantar, mis. 'meliputi:')", False)
+    st.set_page_config(page_title="Parser RPM", layout="centered")
+    st.title("📑 Parser Draft Regulasi → Tabel Review (Word)")
 
     up = st.file_uploader("Upload dokumen (PDF atau DOCX)", type=["pdf", "docx"])
     if not up:
         st.info("Unggah file PDF atau DOCX untuk memulai.")
-        st.stop()
+        return
 
     try:
-        with st.spinner("Membaca dokumen..."):
+        with st.spinner("Memproses dokumen..."):
             if up.name.lower().endswith(".pdf"):
                 lines, warns = extract_pdf_lines(up)
             else:
                 lines, warns = extract_docx_lines(up)
-            doc = detect_hierarchy(lines)
-            df = build_rows(doc, include_parent)
+            df = build_rows(detect_hierarchy(lines))
+            data = to_word_bytes(df) if not df.empty else None
     except Exception as e:  # noqa: BLE001
         st.error(f"Gagal memproses file: {e}")
-        st.stop()
+        return
 
     for w in warns:
         st.warning(w)
-    if df.empty:
+    if data is None:
         st.error("Tidak ada struktur terdeteksi. Pastikan dokumen memuat Menimbang/Mengingat/Menetapkan/BAB/Pasal.")
-        st.stop()
+        return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Baris", len(df))
-    c2.metric("BAB", len(doc.bab_titles))
-    c3.metric("Pasal", df["Pasal"].replace("", None).nunique())
-
-    tab1, tab2, tab3 = st.tabs(["Hierarki", "Tabel (dapat diedit)", "Teks mentah"])
-    with tab1:
-        st.code(hierarchy_preview(doc), language="text")
-    with tab2:
-        edited = st.data_editor(df, use_container_width=True, hide_index=True, num_rows="dynamic",
-                                disabled=["No", "Bab", "Pasal", "Ayat", "Huruf", "Angka", "Bagian", "Draft RPM"])
-        st.download_button("⬇️ Download Excel", to_excel_bytes(edited),
-                           file_name=up.name.rsplit(".", 1)[0] + "_review.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with tab3:
-        st.text_area("Baris hasil ekstraksi (setelah pembersihan)", "\n".join(lines), height=400)
+    st.success(f"Selesai: {len(df)} baris berhasil diekstrak.")
+    st.download_button(
+        "⬇️ Download Word", data,
+        file_name=up.name.rsplit(".", 1)[0] + "_review.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
 
 if __name__ == "__main__":
